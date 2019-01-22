@@ -963,25 +963,6 @@ class HashSetCasperTest extends FlatSpec with Matchers {
       } yield ()
     }
 
-    def rigConnections(
-        n: HashSetCasperTestNode[Effect],
-        nodes: List[HashSetCasperTestNode[Effect]]
-    ): Effect[List[HashSetCasperTestNode[Effect]]] = {
-      import Connections._
-      for {
-        _ <- nodes.traverse(
-              m =>
-                n.connectionsCell
-                  .modify(_.addConn[Effect](m.local)(Monad[Effect], n.logEff, n.metricEff))
-            )
-        _ <- nodes.traverse(
-              m =>
-                m.connectionsCell
-                  .modify(_.addConn[Effect](n.local)(Monad[Effect], m.logEff, m.metricEff))
-            )
-      } yield nodes ++ (n :: Nil)
-    }
-
     val network = TestNetwork.empty[Effect]
 
     for {
@@ -993,7 +974,7 @@ class HashSetCasperTest extends FlatSpec with Matchers {
       (sk, pk) = Ed25519.newKeyPair
       newNode  = HashSetCasperTestNode.standaloneEff(genesis, sk, testNetwork = network)
       _        <- bond(nodes(0), (sk, pk))
-      all      <- rigConnections(newNode, nodes)
+      all      <- HashSetCasperTestNode.rigConnectionsF[Effect](newNode, nodes)
 
       _ <- stepSplit(all)
       _ <- stepSplit(all)
