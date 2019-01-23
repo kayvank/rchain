@@ -168,12 +168,12 @@ object HashSetCasperTestNode {
       _ <- nodes.traverse(
             m =>
               n.connectionsCell
-                .modify(_.addConn[F](m.local)(Monad[F], n.logEff, n.metricEff))
+                .flatModify(_.addConn[F](m.local)(Monad[F], n.logEff, n.metricEff))
           )
       _ <- nodes.traverse(
             m =>
               m.connectionsCell
-                .modify(_.addConn[F](n.local)(Monad[F], m.logEff, m.metricEff))
+                .flatModify(_.addConn[F](n.local)(Monad[F], m.logEff, m.metricEff))
           )
     } yield nodes ++ (n :: Nil)
   }
