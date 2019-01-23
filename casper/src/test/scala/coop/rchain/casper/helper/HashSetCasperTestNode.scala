@@ -308,7 +308,7 @@ object HashSetCasperTestNode {
                                 )(Monad[F], Concurrent[F], Sync[F], Log[F], blockStore)
               semaphore <- Semaphore[F](1)
               casperState <- Cell.mvarCell[F, CasperState](
-                              CasperState(Set.empty[BlockMessage], Set.empty[Deploy])
+                              CasperState()
                             )
               node = new HashSetCasperTestNode[F](
                 n,
@@ -351,7 +351,9 @@ object HashSetCasperTestNode {
             case (f, (n, m)) =>
               f.flatMap(
                 _ =>
-                  n.connectionsCell.modify(_.addConn[F](m.local)(Monad[F], n.logEff, n.metricEff))
+                  n.connectionsCell.flatModify(
+                    _.addConn[F](m.local)(Monad[F], n.logEff, n.metricEff)
+                  )
               )
           }
     } yield nodes

@@ -23,12 +23,14 @@ import coop.rchain.shared._
 /**
   Encapsulates mutable state of the MultiParentCasperImpl
 
+  @param seenBlockHashes - tracks hashes of all blocks seen so far
   @param blockBuffer
   @param deployHistory
   @param invalidBlockTracker
   @param equivocationsTracker: Used to keep track of when other validators detect the equivocation consisting of the base block at the sequence number identified by the (validator, base equivocation sequence number) pair of each EquivocationRecord.
   */
-case class CasperState(
+final case class CasperState(
+    seenBlockHashes: Set[BlockHash] = Set.empty[BlockHash],
     blockBuffer: Set[BlockMessage] = Set.empty[BlockMessage],
     deployHistory: Set[Deploy] = Set.empty[Deploy],
     invalidBlockTracker: Set[BlockHash] = Set.empty[BlockHash],
@@ -69,10 +71,8 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
           dag            <- blockDag
           blockHash      = b.blockHash
           containsResult <- dag.contains(blockHash)
-          state          <- Cell[F, CasperState].read
-          result <- if (containsResult || state.blockBuffer.exists(
-                          _.blockHash == blockHash
-                        )) {
+          s              <- Cell[F, CasperState].read
+          result <- if (containsResult || s.seenBlockHashes.contains(blockHash)) {
                      Log[F]
                        .info(
                          s"Block ${PrettyPrinter.buildString(b.blockHash)} has already been processed by another thread."
@@ -84,7 +84,9 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
                          val sender = ByteString.copyFrom(publicKey)
                          handleDoppelganger(b, sender)
                        case None => ().pure[F]
-                     }) *> internalAddBlock(b)
+                     }) *> Cell[F, CasperState].modify { s =>
+                       s.copy(seenBlockHashes = s.seenBlockHashes + b.blockHash)
+                     } *> internalAddBlock(b)
                    }
         } yield result
     )(_ => blockProcessingLock.release)
@@ -108,10 +110,9 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
             case _ =>
               Cell[F, CasperState].modify { s =>
                 s.copy(
-                    blockBuffer = (s.blockBuffer - b),
-                    dependencyDag = DoublyLinkedDagOperations.remove(s.dependencyDag, b.blockHash)
-                  )
-                  .pure[F]
+                  blockBuffer = (s.blockBuffer - b),
+                  dependencyDag = DoublyLinkedDagOperations.remove(s.dependencyDag, b.blockHash)
+                )
               }
           }
       _ <- attempt match {
@@ -159,7 +160,7 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
       stateBefore        <- Cell[F, CasperState].read
       initialHistorySize = stateBefore.deployHistory.size
       _ <- Cell[F, CasperState].modify { s =>
-            s.copy(deployHistory = s.deployHistory -- deploys).pure[F]
+            s.copy(deployHistory = s.deployHistory -- deploys)
           }
 
       stateAfter     <- Cell[F, CasperState].read
@@ -192,10 +193,10 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
       b: BlockMessage
   ): F[Boolean] =
     for {
-      blockStoreContains  <- BlockStore[F].contains(b.blockHash)
-      state               <- Cell[F, CasperState].read
-      blockBufferContains = state.blockBuffer.contains(b)
-    } yield (blockStoreContains || blockBufferContains)
+      blockStoreContains <- BlockStore[F].contains(b.blockHash)
+      state              <- Cell[F, CasperState].read
+      bufferContains     = state.blockBuffer.exists(_.blockHash == b.blockHash)
+    } yield (blockStoreContains || bufferContains)
 
   def deploy(d: DeployData): F[Either[Throwable, Unit]] =
     InterpreterUtil.mkTerm(d.term) match {
@@ -214,7 +215,7 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
   def addDeploy(deploy: Deploy): F[Unit] =
     for {
       _ <- Cell[F, CasperState].modify { s =>
-            s.copy(deployHistory = s.deployHistory + deploy).pure[F]
+            s.copy(deployHistory = s.deployHistory + deploy)
           }
       _ <- Log[F].info(s"Received ${PrettyPrinter.buildString(deploy)}")
     } yield ()
@@ -439,7 +440,7 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
         )
       case MissingBlocks => {
         Cell[F, CasperState].modify { s =>
-          s.copy(blockBuffer = s.blockBuffer + block).pure[F]
+          s.copy(blockBuffer = s.blockBuffer + block)
         } *> fetchMissingDependencies(block)
       }
       case AdmissibleEquivocation =>
@@ -451,12 +452,12 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
                   block.sender == validator && baseEquivocationBlockSeqNum == seqNum
               }) {
             // More than 2 equivocating children from base equivocation block and base block has already been recorded
-            s.pure[F]
+            s
           } else {
             val newEquivocationRecord =
               EquivocationRecord(block.sender, baseEquivocationBlockSeqNum, Set.empty[BlockHash])
             s.copy(equivocationsTracker = s.equivocationsTracker + (newEquivocationRecord))
-          }.pure[F]
+          }
         } *>
           addToState(block) *> CommUtil.sendBlock[F](block) *> Log[F].info(
           s"Added admissible equivocation child block ${PrettyPrinter.buildString(block.blockHash)}"
@@ -509,21 +510,17 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
       b: BlockMessage
   ): F[Unit] =
     for {
-      dag            <- blockDag
-      missingParents = parentHashes(b).toSet
-      missingJustifications = b.justifications
-        .map(_.latestBlockHash)
-        .toSet
-      allDependencies = (missingParents union missingJustifications).toList
-      missingDependencies <- allDependencies.filterA(
-                              blockHash =>
-                                dag
-                                  .lookup(blockHash)
-                                  .map(_.isEmpty)
-                            )
+      dag <- blockDag
+      missingDependencies <- dependenciesHashesOf(b)
+                              .filterA(
+                                blockHash =>
+                                  dag
+                                    .lookup(blockHash)
+                                    .map(_.isEmpty)
+                              )
       state <- Cell[F, CasperState].read
       missingUnseenDependencies = missingDependencies.filter(
-        blockHash => !state.blockBuffer.exists(_.blockHash == blockHash)
+        blockHash => !state.seenBlockHashes.contains(blockHash)
       )
       _ <- missingDependencies.traverse(hash => handleMissingDependency(hash, b))
       _ <- missingUnseenDependencies.traverse(hash => requestMissingDependency(hash))
@@ -533,10 +530,9 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
     Cell[F, CasperState].modify(
       s =>
         s.copy(
-            dependencyDag = DoublyLinkedDagOperations
-              .add[BlockHash](s.dependencyDag, hash, childBlock.blockHash)
-          )
-          .pure[F]
+          dependencyDag = DoublyLinkedDagOperations
+            .add[BlockHash](s.dependencyDag, hash, childBlock.blockHash)
+        )
     )
 
   private def requestMissingDependency(hash: BlockHash) =
@@ -549,7 +545,7 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
           )
       // TODO: Slash block for status except InvalidUnslashableBlock
       _ <- Cell[F, CasperState].modify { s =>
-            s.copy(invalidBlockTracker = s.invalidBlockTracker + block.blockHash).pure[F]
+            s.copy(invalidBlockTracker = s.invalidBlockTracker + block.blockHash)
           }
       _ <- addToState(block)
     } yield ()
@@ -601,7 +597,7 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
   ): F[Unit] = {
     val addedBlocks = successfulAdds.map(_._1)
     Cell[F, CasperState].modify { s =>
-      s.copy(blockBuffer = s.blockBuffer -- addedBlocks).pure[F]
+      s.copy(blockBuffer = s.blockBuffer -- addedBlocks)
     }
   }
 
@@ -611,10 +607,9 @@ class MultiParentCasperImpl[F[_]: Sync: Concurrent: Capture: ConnectionsCell: Tr
   ): F[Unit] =
     Cell[F, CasperState].modify { s =>
       s.copy(dependencyDag = successfulAdds.foldLeft(blockBufferDependencyDag) {
-          case (acc, successfulAdd) =>
-            DoublyLinkedDagOperations.remove(acc, successfulAdd._1.blockHash)
-        })
-        .pure[F]
+        case (acc, successfulAdd) =>
+          DoublyLinkedDagOperations.remove(acc, successfulAdd._1.blockHash)
+      })
     }
 
   def getRuntimeManager: F[Option[RuntimeManager[F]]] =
