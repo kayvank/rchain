@@ -18,9 +18,11 @@ trait History[F[_]] {
 
 object History {
 
-  val emptyRoot: Trie               = EmptyTrie
-  private[this] def encodeEmptyRoot = Trie.codecTrie.encode(emptyRoot).get.toByteVector
-  val emptyRootHash: Blake2b256Hash = Blake2b256Hash.create(encodeEmptyRoot)
+  val emptyRoot: Trie = EmptyTrie
+  private[this] def encodeEmptyRoot =
+    Trie.codecTrie.encode(emptyRoot).get.toByteVector
+  val emptyRootHash: Blake2b256Hash =
+    Blake2b256Hash.create(encodeEmptyRoot)
 
   // this mapping is kept explicit on purpose
   @inline

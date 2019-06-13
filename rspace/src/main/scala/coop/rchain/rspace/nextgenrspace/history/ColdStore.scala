@@ -7,7 +7,7 @@ import scodec.Codec
 import scodec.bits.ByteVector
 import scodec.codecs.{discriminated, uint2}
 import coop.rchain.rspace.internal.codecByteVector
-import coop.rchain.shared.AttemptOps.RichAttempt
+import coop.rchain.shared.{AttemptOpsF => G}
 
 trait ColdStore[F[_]] {
   def put(hash: Blake2b256Hash, data: PersistedData): F[Unit]
@@ -34,16 +34,19 @@ object ColdStoreInstances {
   def coldStore[F[_]: Sync](store: Store[F]): ColdStore[F] = new ColdStore[F] {
     private val codec = codecPersistedData
 
+    import G.RichAttempt
     override def put(key: Blake2b256Hash, d: PersistedData): F[Unit] =
-      store.put(key, codec.encode(d).get)
-
-    override def get(key: Blake2b256Hash): F[Option[PersistedData]] =
       for {
-        maybeBytes <- store.get(key)
-        result = maybeBytes.map(
-          bytes => codec.decode(bytes).get.value
-        )
-      } yield result
+        encoded <- codec.encode(d).get
+        data    <- store.put(key, encoded)
+      } yield data
+
+    def get(key: Blake2b256Hash): F[Option[PersistedData]] =
+      for {
+        maybeBytes         ← store.get(key)
+        maybeDecoded       <- maybeBytes.map(bytes ⇒ codec.decode(bytes).get).sequence
+        maybePersistedData = maybeDecoded.map(_.value)
+      } yield maybePersistedData
 
     override def close(): F[Unit] = store.close()
   }
