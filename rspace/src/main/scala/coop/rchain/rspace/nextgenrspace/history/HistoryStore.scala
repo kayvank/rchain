@@ -4,6 +4,7 @@ import cats.implicits._
 import cats.effect.Sync
 import coop.rchain.rspace.Blake2b256Hash
 import coop.rchain.shared.AttemptOpsF.RichAttempt
+import scodec.bits.BitVector
 
 trait HistoryStore[F[_]] {
   def put(tries: List[Trie]): F[Unit]
@@ -14,20 +15,19 @@ trait HistoryStore[F[_]] {
 }
 
 object HistoryStoreInstances {
+  type KVData = (Blake2b256Hash, BitVector)
   def historyStore[F[_]: Sync](store: Store[F]): HistoryStore[F] = new HistoryStore[F] {
     // TODO put list
     override def put(tries: List[Trie]): F[Unit] = {
-      def put(t: Trie): F[Unit] = {
-        val k = Trie.hash(t)
+
+      def asEncoded(t: Trie): F[KVData] =
         for {
           b <- Trie.codecTrie.encode(t).get
-          _ <- store.put(k, b)
-        } yield ()
-      }
-      for {
-        _ <- tries traverse put
-      } yield ()
+          k = Trie.hash(t)
+        } yield (k, b)
 
+      val encodedList: F[List[KVData]] = (tries map asEncoded).sequence
+      encodedList.flatMap(t => store.put(t))
     }
 
     override def get(key: Blake2b256Hash): F[Trie] =
