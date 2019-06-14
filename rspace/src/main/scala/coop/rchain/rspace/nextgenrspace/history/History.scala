@@ -5,8 +5,11 @@ import scodec.{Attempt, Codec}
 import scodec.bits.{BitVector, ByteVector}
 import scodec.codecs.{discriminated, provide, uint, uint2, vectorOfN}
 import coop.rchain.rspace.internal.codecByteVector
-import coop.rchain.shared.AttemptOps._
 import History._
+import cats.{Applicative, FlatMap}
+import cats.effect.Sync
+import cats.implicits._
+import coop.rchain.shared.AttemptOpsF._
 
 trait History[F[_]] {
   def process(actions: List[HistoryAction]): F[History[F]]
@@ -19,10 +22,14 @@ trait History[F[_]] {
 object History {
 
   val emptyRoot: Trie = EmptyTrie
-  private[this] def encodeEmptyRoot =
-    Trie.codecTrie.encode(emptyRoot).get.toByteVector
-  val emptyRootHash: Blake2b256Hash =
-    Blake2b256Hash.create(encodeEmptyRoot)
+  private[this] def encodeEmptyRoot[F[_]: Sync]: F[ByteVector] =
+    for {
+      bitVector  <- Trie.codecTrie.encode(emptyRoot).get
+      byteVector = bitVector.toByteVector
+    } yield (byteVector)
+
+  def emptyRootHash[F[_]: Sync] =
+    encodeEmptyRoot.map(x ⇒ Blake2b256Hash.create(x))
 
   // this mapping is kept explicit on purpose
   @inline
@@ -37,38 +44,58 @@ object History {
   def commonPrefix(l: KeyPath, r: KeyPath): KeyPath =
     (l.view, r.view).zipped.takeWhile { case (ll, rr) => ll == rr }.map(_._1).toSeq
 
-  def skip(pb: PointerBlock, affix: KeyPath): Trie =
-    Skip(ByteVector(affix), NodePointer(pb.hash))
+  def skip[F[_]: Sync](pb: PointerBlock, affix: KeyPath): F[Trie] =
+    for {
+      pbHashed <- pb.hash
+      trie = Skip(
+        ByteVector(affix),
+        NodePointer(pbHashed)
+      )
+    } yield (trie)
 
   type KeyPath = Seq[Byte]
 }
 
 sealed trait Trie
-sealed trait NonEmptyTrie extends Trie
-case object EmptyTrie     extends Trie
-final case class Skip(affix: ByteVector, ptr: ValuePointer) extends NonEmptyTrie {
-  lazy val encoded: BitVector = Trie.codecSkip.encode(this).get
+sealed trait NonEmptyTrie                                   extends Trie
+case object EmptyTrie                                       extends Trie
+final case class Skip(affix: ByteVector, ptr: ValuePointer) extends NonEmptyTrie
 
-  lazy val hash: Blake2b256Hash = Blake2b256Hash.create(encoded.toByteVector)
+object SkipOps {
+  implicit class _SkipOps(val s: Skip) {
+    def encoded[F[_]: Sync]: F[BitVector] = Trie.codecSkip.encode(this).get
+    def hash[F[_]: Sync]: F[Blake2b256Hash] =
+      encoded.map(e => Blake2b256Hash.create(e.toByteVector))
+  }
 }
 
-final case class PointerBlock private (toVector: Vector[TriePointer]) extends NonEmptyTrie {
-  def updated(tuples: List[(Int, TriePointer)]): PointerBlock =
-    new PointerBlock(tuples.foldLeft(toVector) { (vec, curr) =>
-      vec.updated(curr._1, curr._2)
-    })
+final case class PointerBlock private (toVector: Vector[TriePointer]) extends NonEmptyTrie
+object PointerBlockOps {
+  implicit class _PointerBlockOps(val pb: PointerBlock) {
+    def updated(tuples: List[(Int, TriePointer)]): PointerBlock =
+      new PointerBlock(tuples.foldLeft(toVector) { (vec, curr) =>
+        vec.updated(curr._1, curr._2)
+      })
 
-  def countNonEmpty: Int = toVector.count(_ != EmptyPointer)
+    def countNonEmpty: Int = toVector.count(_ != EmptyPointer)
 
-  lazy val encoded: BitVector = PointerBlock.codecPointerBlock.encode(this).get
+    def encoded[F[_]: Sync]: F[BitVector] =
+      PointerBlock.codecPointerBlock.encode(this).get
 
-  lazy val hash: Blake2b256Hash = Blake2b256Hash.create(encoded.toByteVector)
+    def hash[F[_]: Sync]: F[Blake2b256Hash] =
+      encoded.map(x => Blake2b256Hash.create(x.toByteVector))
 
-  override def toString: String = {
-    val pbs =
-      toVector.zipWithIndex.filter { case (v, _) => v != EmptyPointer }.map(_.swap).mkString(";")
-    s"PB($hash: $pbs)"
+    def toString[F[_]: Sync]: F[String] =
+      for {
+        h ← hash
+        pbs = toVector.zipWithIndex
+          .filter { case (v, _) => v != EmptyPointer }
+          .map(_.swap)
+          .mkString(";")
+        s = s"PB($h: $pbs)"
+      } yield s
   }
+
 }
 
 sealed trait TriePointer
@@ -83,7 +110,8 @@ final case class SkipPointer(hash: Blake2b256Hash) extends NonEmptyTriePointer
 final case class NodePointer(hash: Blake2b256Hash) extends ValuePointer
 
 object Trie {
-  def hash(trie: Trie): Blake2b256Hash =
+  import SkipOps._
+  def hash[F[_]: Sync](trie: Trie): F[Blake2b256Hash] =
     trie match {
       case pb: PointerBlock  => pb.hash
       case s: Skip           => s.hash
@@ -92,14 +120,14 @@ object Trie {
 
   val codecSkip: Codec[Skip] = (codecByteVector :: codecTrieValuePointer).as[Skip]
 
-  val memoizingSkipCodec: Codec[Skip] =
-    Codec.apply((s: Skip) => Attempt.successful(s.encoded), codecSkip.decode)
+  def memoizingSkipCodec: Codec[Skip] = ???
+//    Codec.apply((s: Skip) => Attempt.successful(s.encoded), codecSkip.decode)
 
-  val memoizingPointerBlockCodec: Codec[PointerBlock] =
-    Codec.apply(
-      (s: PointerBlock) => Attempt.successful(s.encoded),
-      PointerBlock.codecPointerBlock.decode
-    )
+  def memoizingPointerBlockCodec: Codec[PointerBlock] = ???
+//    Codec.apply(
+//      (s: PointerBlock) => Attempt.successful(s.encoded),
+//      PointerBlock.codecPointerBlock.decode
+//    )
 
   val codecTrie: Codec[Trie] =
     discriminated[Trie]
@@ -143,6 +171,7 @@ object Trie {
 }
 
 object PointerBlock {
+
   val length = 256
 
   def create(): PointerBlock = new PointerBlock(Vector.fill(length)(EmptyPointer))
